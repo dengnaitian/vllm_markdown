@@ -2261,6 +2261,76 @@ python -m vllm.entrypoints.afd_ffn_server \
 | **进程管理** | 手动管理 | EngineCore 管理 |
 | **监控集成** | 需自建 | 复用 EngineCore 监控 |
 
+#### FFN 三层架构概览
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    AFD FFN Service 三层架构                            │
+│                                                                         │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │ 第 1 层: 服务管理层 (仅方式二)                                          │  │
+│  │  ┌──────────────┐        ┌──────────────┐        ┌──────────────┐  │  │
+│  │  │run_engine_core│        │EngineCoreProc│        │ ZMQ Handshake│  │  │
+│  │  │              │──►      │              │◄─────►│              │  │  │
+│  │  │ (进程启动)    │        │(包装层)      │        │ (与Front-end)  │  │  │
+│  │  └──────────────┘        └──────┬───────┘        └──────────────┘  │  │
+│  │                                      │  (方式一无此层)            │  │  │
+│  │  ┌──────────────────────────────────────────────────────────────┐  │  │
+│  │  │ AFDFFNServer (方式一)                                       │  │  │
+│  │  │ • 创建 VllmConfig                                           │  │  │
+│  │  │ • 启动服务循环                                               │  │  │
+│  │  └──────────────────────────────────────────────────────────────┘  │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+│                                │                                          │
+│                                ▼                                          │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │ 第 2 层: 执行管理层                                                  │  │
+│  │  ┌────────────────────────────────────────────────────────────────┐ │  │
+│  │  │ MultiprocExecutor                                            │ │  │
+│  │  │   ├─ 创建 Worker 进程 (TP 个)                                 │ │  │
+│  │  │   ├─ Worker 进程生命周期管理                                  │ │  │
+│  │  │   └─ collective_rpc() 通信                                   │ │  │
+│  │  └────────────────────────────────────────────────────────────────┘ │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+│                                │                                          │
+│                                ▼                                          │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │ 第 3 层: 计算服务层                                                  │  │
+│  │  ┌────────────────────────────────────────────────────────────────┐ │  │
+│  │  │ GPUWorker (每个 TP Rank)                                     │ │  │
+│  │  │   ├─ init_device()                                            │ │  │
+│  │  │   └─ 主循环: process_input_sockets ◄─► RPC 处理          │ │  │
+│  │  └────────────────────────────────────────────────────────────────┘ │  │
+│  │                          │                                       │  │
+│  │  │                          ▼                                       │  │
+│  │  │ ┌────────────────────────────────────────────────────────────────┐ │  │
+│  │  │ GPUFFNModelRunner (FFN 专用)                                 │ │  │
+│  │  │   ├─ capture_model() (CUDA Graph 捕获)                       │  │  │
+│  │  │   ├─ initialize_afd_connector() (初始化连接)                 │ │  │  │
+│  │  │   ├─ execute_model() (FFN 服务主循环)                         │  │  │
+│  │  │   │   ├─ recv_attn_output() (接收 Attention 数据)           │  │  │
+│  │  │   │   ├─ _execute_eager_mode() 或                              │  │  │
+│  │  │   │   │ _execute_with_cuda_graph() (FFN 计算)             │  │  │
+│  │  │   │   └─ send_ffn_output() (返回结果)                       │  │  │  │
+│  │  │   └─ _ffn_thread (daemon 线程，持续监听)                    │ │  │
+│  │  └────────────────────────────────────────────────────────────────┘ │  │
+│  │                          │                                       │  │  │
+│  │  │                          ▼                                       │  │  │
+│  │  │ ┌────────────────────────────────────────────────────────────────┐ │  │
+│  │  │ AFDConnector 通信层                                            │ │  │ │
+│  │  │   ├─ recv_attn_output(): 接收 Attention 数据                     │ │  │ │
+│  │  │   ├─ send_ffn_output(): 发送 FFN 结果回 Attention              │ │  │ │
+│  │  │   └─ 网络: HCCL/P2P (张量) + Gloo (元数据)                │ │  │ │
+│  │  └────────────────────────────────────────────────────────────────┘ │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+│                                                                         │
+│  【关键差异】                                                            │
+│  • 方式一: AFDFFNServer → MultiprocExecutor → Worker                     │
+│  • 方式二: EngineCoreProc → MultiprocExecutor → Worker (含 ZMQ 层)      │
+│  • 两者在第 3 层完全相同                                              │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
 ---
 
 ### FFN Service 架构概览
@@ -2300,16 +2370,228 @@ graph TB
     style M4 fill:#ff9800
 ```
 
-### 核心职责
+#### 三层架构概览
 
-| 职责                | 说明                                         |
-| ----------------- | ------------------------------------------ |
-| **接收数据**          | 通过 AFDConnector 接收来自 Attention Service 的数据 |
-| **Expert 分发**     | 根据 topk_ids 将 hidden_states 分发到对应 Expert   |
-| **MoE 计算**        | 各 Expert 并行计算 FFN 层                        |
-| **结果返回**          | 通过 AFDConnector 发送计算结果回 Attention Service  |
-| **CUDA Graph 优化** | 支持 CUDA Graph 加速 FFN 计算                    |
-|                   |                                            |
+FFN Service 有两种启动方式，它们的架构层次不同：
+
+---
+
+##### 方式一：独立进程启动架构
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│               AFD FFN Service 三层架构 (独立进程启动)                     │
+│                                                                         │
+│  启动命令: python -m vllm.entrypoints.afd_ffn_server <model> \          │
+│            --tensor-parallel-size 8 --afd-config '{"afd_role": "ffn"}' │
+│                                                                         │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │ 第 1 层: 服务管理层                                                 │  │
+│  │  ┌─────────────────────────────────────────────────────────────┐   │  │
+│  │  │ AFDFFNServer (afd_ffn_server.py)                          │   │  │
+│  │  │                                                             │   │  │
+│  │  │  职责:                                                       │   │  │
+│  │  │  • 创建 VllmConfig                                         │   │  │
+│  │  │  • 创建 Executor 实例                                       │   │  │
+│  │  │  • 调用 collective_rpc("start_ffn_server_loop")            │   │  │
+│  │  │  • 适用于独立的 FFN Service 部署                            │   │  │
+│  │  └─────────────────────────────────────────────────────────────┘   │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+│                                │                                          │
+│                                ▼                                          │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │ 第 2 层: 执行层                                                     │  │
+│  │  ┌─────────────────────────────────────────────────────────────┐   │  │
+│  │  │ MultiprocExecutor (或其他 Executor)                        │   │  │
+│  │  │                                                             │   │  │
+│  │  │  创建流程:                                                   │   │  │
+│  │  │  1. Executor.get_class(vllm_config)                        │   │  │
+│  │  │     • 根据 distributed_executor_backend 配置选择 Executor:   │   │  │
+│  │  │       - "mp" (默认) → MultiprocExecutor                    │   │  │
+│  │  │       - "ray" → RayDistributedExecutor                     │   │  │
+│  │  │       - "uni" → UniProcExecutor                            │   │  │
+│  │  │       - "external_launcher" → ExecutorWithExternalLauncher │   │  │
+│  │  │                                                             │   │  │
+│  │  │  2. executor_class(vllm_config=vllm_config)                │   │  │
+│  │  │     • 创建 Executor 实例                                     │   │  │
+│  │  │     • 调用 _init_executor() 初始化                          │   │  │
+│  │  │                                                             │   │  │
+│  │  │  3. MultiprocExecutor._init_executor()                     │   │  │
+│  │  │     • world_size = tp_size × pp_size × pcp_size             │   │  │
+│  │  │     • FFN Service 通常只用 TP，所以 world_size = tp_size     │   │  │
+│  │  │     • 创建 world_size 个 Worker 进程 (即 EP Worker 数量)     │   │  │
+│  │  │     • 初始化 TP Process Group (用于 EP 通信)                │   │  │
+│  │  │     • 设置进程间通信 (Pipe, MessageQueue)                   │   │  │
+│  │  │                                                             │   │  │
+│  │  │  职责:                                                       │   │  │
+│  │  │  • 创建并管理 EP Worker 进程 (数量 = tp_size)                │   │  │
+│  │  │  • 实现 collective_rpc() 与 Worker 通信                     │   │  │
+│  │  │  • 监控 Worker 健康状态                                     │   │  │
+│  │  │                                                             │   │  │
+│  │  │  【EP (Expert Parallel) 原理】                                │   │  │
+│  │  │  • EP 通过 TP 实现：每个 TP Rank 处理不同的 Expert 子集      │   │  │
+│  │  │  • enable_expert_parallel=True 时启用 EP                    │   │  │
+│  │  │  • TP world_size = EP worker 数量                           │   │  │
+│  │  │  • tensor_model_parallel_all_gather() 收集所有 EP 输出       │   │  │
+│  │  └─────────────────────────────────────────────────────────────┘   │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+│                                │                                          │
+│                                ▼                                          │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │ 第 3 层: 计算通信层                                                  │  │
+│  │  ┌────────────────────────────────────────────────────────────┐    │  │
+│  │  │ GPUWorker (每个 TP Rank)                                   │    │  │
+│  │  │   ├─ start_ffn_server_loop()                               │    │  │
+│  │  │   │   ├─ capture_model()                                   │    │  │
+│  │  │   │   ├─ initialize_afd_connector()                        │    │  │
+│  │  │   │   └─ 启动 ffn_worker_loop 线程                          │    │  │
+│  │  │   └─ 创建 GPUFFNModelRunner                                │    │  │
+│  │  └────────────────────────────────────────────────────────────┘    │  │
+│  │                          │                                       │  │
+│  │                          ▼                                       │  │
+│  │  ┌────────────────────────────────────────────────────────────┐    │  │
+│  │  │ GPUFFNModelRunner (核心计算单元)                           │    │  │
+│  │  │   ├─ recv_attn_output(): 接收 Attention 数据              │    │  │
+│  │  │   ├─ _execute_eager_mode(): Eager 模式执行                 │    │  │
+│  │  │   ├─ _execute_with_cuda_graph(): CUDA Graph 执行           │    │  │
+│  │  │   ├─ Expert Dispatch: 根据 topk_ids 分发到各 Expert        │    │  │
+│  │  │   ├─ MoE Computation: 各 Expert 并行计算                   │    │  │
+│  │  │   └─ send_ffn_output(): 发送结果回 Attention Service       │    │  │
+│  │  └────────────────────────────────────────────────────────────┘    │  │
+│  │                          │                                       │  │
+│  │                          ▼                                       │  │
+│  │  ┌────────────────────────────────────────────────────────────┐    │  │
+│  │  │ AFDConnector 通信层                                        │    │  │
+│  │  │   ├─ init_afd_connector(): 初始化连接                      │    │  │
+│  │  │   ├─ recv_attn_output(): 接收来自 Attention 的数据         │    │  │
+│  │  │   ├─ send_ffn_output(): 发送 FFN 结果到 Attention          │    │  │
+│  │  │   └─ 网络: HCCL + Gloo (与 Attention Service P2P 通信)     │    │  │
+│  │  └────────────────────────────────────────────────────────────┘    │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+##### 方式二：EngineCore 包装启动架构
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│            AFD FFN Service 三层架构 (EngineCore 包装启动)                │
+│                                                                         │
+│  启动方式: 通过 Attention Service 管理框架启动                           │
+│                                                                         │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │ 第 1 层: 服务管理层                                                 │  │
+│  │  ┌─────────────────────────────────────────────────────────────┐   │  │
+│  │  │ EngineCoreProc (core.py)                                   │   │  │
+│  │  │                                                             │   │  │
+│  │  │  职责:                                                       │   │  │
+│  │  │  1. ZMQ 握手 (与 Front-end)                                 │   │  │
+│  │  │     • HELLO → 初始化消息 → READY                            │   │  │
+│  │  │                                                             │   │  │
+│  │  │  2. 启动 I/O 线程                                            │   │  │
+│  │  │     • process_input_sockets thread                          │   │  │
+│  │  │     • process_output_sockets thread                         │   │  │
+│  │  │                                                             │   │  │
+│  │  │  3. 初始化 DP 环境                                           │   │  │
+│  │  │     • stateless_init_dp_group()                             │   │  │
+│  │  │                                                             │   │  │
+│  │  │  4. 创建 EngineCore                                         │   │  │
+│  │  │     • 【关键】if afd_role == "ffn": return                  │   │  │
+│  │  │     • 跳过 Scheduler、KV Cache 初始化                        │   │  │
+│  │  │                                                             │   │  │
+│  │  │  5. run_busy_loop()                                        │   │  │
+│  │  │     • 【关键】if afd_role == "ffn":                        │   │  │
+│  │  │     • collective_rpc("start_ffn_server_loop")              │   │  │
+│  │  │     • threading.Event().wait() [阻塞]                       │   │  │
+│  │  │                                                             │   │  │
+│  │  │  【特点】                                                    │   │  │
+│  │  │  • 复用 EngineCore 的握手机制和进程管理                     │   │  │
+│  │  │  • 适用于统一管理的场景                                      │   │  │
+│  │  └─────────────────────────────────────────────────────────────┘   │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+│                                │                                          │
+│                                ▼                                          │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │ 第 2 层: 执行层                                                     │  │
+│  │  ┌─────────────────────────────────────────────────────────────┐   │  │
+│  │  │ MultiprocExecutor (通过 EngineCore 创建)                    │   │  │
+│  │  │                                                             │   │  │
+│  │  │  职责:                                                       │   │  │
+│  │  │  • 创建 TP 个 Worker 进程                                    │   │  │
+│  │  │  • 管理 Worker 生命周期                                     │   │  │
+│  │  │  • 实现 collective_rpc() 与 Worker 通信                     │   │  │
+│  │  │                                                             │   │  │
+│  │  │  【TP 并行】                                                  │   │  │
+│  │  │  • 每个 TP Rank 独立运行 FFN 计算                            │   │  │
+│  │  │  • 通过 TP Process Group 同步                               │   │  │
+│  │  └─────────────────────────────────────────────────────────────┘   │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+│                                │                                          │
+│                                ▼                                          │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │ 第 3 层: 计算通信层 (与方式一相同)                                   │  │
+│  │  ┌────────────────────────────────────────────────────────────┐    │  │
+│  │  │ GPUWorker (每个 TP Rank)                                   │    │  │
+│  │  │   ├─ start_ffn_server_loop()                               │    │  │
+│  │  │   │   ├─ capture_model()                                   │    │  │
+│  │  │   │   ├─ initialize_afd_connector()                        │    │  │
+│  │  │   │   └─ 启动 ffn_worker_loop 线程                          │    │  │
+│  │  │   └─ 创建 GPUFFNModelRunner                                │    │  │
+│  │  └────────────────────────────────────────────────────────────┘    │  │
+│  │                          │                                       │  │
+│  │                          ▼                                       │  │
+│  │  ┌────────────────────────────────────────────────────────────┐    │  │
+│  │  │ GPUFFNModelRunner (核心计算单元)                           │    │  │
+│  │  │   ├─ recv_attn_output(): 接收 Attention 数据              │    │  │
+│  │  │   ├─ _execute_eager_mode(): Eager 模式执行                 │    │  │
+│  │  │   ├─ _execute_with_cuda_graph(): CUDA Graph 执行           │    │  │
+│  │  │   ├─ Expert Dispatch: 根据 topk_ids 分发到各 Expert        │    │  │
+│  │  │   ├─ MoE Computation: 各 Expert 并行计算                   │    │  │
+│  │  │   └─ send_ffn_output(): 发送结果回 Attention Service       │    │  │
+│  │  └────────────────────────────────────────────────────────────┘    │  │
+│  │                          │                                       │  │
+│  │                          ▼                                       │  │
+│  │  ┌────────────────────────────────────────────────────────────┐    │  │
+│  │  │ AFDConnector 通信层                                        │    │  │
+│  │  │   ├─ init_afd_connector(): 初始化连接                      │    │  │
+│  │  │   ├─ recv_attn_output(): 接收来自 Attention 的数据         │    │  │
+│  │  │   ├─ send_ffn_output(): 发送 FFN 结果到 Attention          │    │  │
+│  │  │   └─ 网络: HCCL + Gloo (与 Attention Service P2P 通信)     │    │  │
+│  │  └────────────────────────────────────────────────────────────┘    │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+##### 两种启动方式对比
+
+| 对比维度 | 方式一: 独立进程启动 | 方式二: EngineCore 包装 |
+|---------|---------------------|------------------------|
+| **启动入口** | `afd_ffn_server.py` | `run_engine_core()` |
+| **第 1 层组件** | AFDFFNServer | EngineCoreProc |
+| **ZMQ 握手** | ❌ 无 | ✅ 有 (与 Front-end) |
+| **DP 环境初始化** | ❌ 无 | ✅ stateless_init_dp_group() |
+| **I/O 线程** | ❌ 无 | ✅ input/output sockets threads |
+| **Scheduler 初始化** | ❌ 无 | ❌ 跳过 (afd_role=="ffn") |
+| **KV Cache 初始化** | ❌ 无 | ❌ 跳过 (afd_role=="ffn") |
+| **第 2、3 层** | ✅ 完全相同 | ✅ 完全相同 |
+| **适用场景** | 独立部署 FFN Service | 统一管理、与 Attention Service 协同启动 |
+
+**核心差异**：两种启动方式仅在第 1 层不同，第 2、3 层完全相同。方式一更简洁，方式二复用了 EngineCore 的管理框架。
+
+#### 核心组件职责
+
+| 组件 | 职责 | AFD 特定 |
+|------|------|----------|
+| **AFDFFNServer** | 独立进程启动入口 | 创建 VllmConfig，直接创建 Executor，启动服务循环 |
+| **EngineCoreProc** | 包装启动模式 | ZMQ 握手，DP 环境初始化，跳过 Scheduler/KVCache |
+| **MultiprocExecutor** | Worker 进程管理 | 创建 TP 个 GPUWorker 进程 |
+| **GPUWorker** | Worker 实现 | start_ffn_server_loop() 启动 FFN 服务循环 |
+| **GPUFFNModelRunner** | FFN 模型执行器 | MoE FFN 计算，CUDA Graph 优化，与 Attention Service 通信 |
+| **AFDConnector** | 通信层 | 与 Attention Service 的 P2P 通信 |
 
 ### 执行流程详解
 
@@ -3347,6 +3629,281 @@ graph TD
 │     return SamplerOutput(token_id, logprobs)               │
 └─────────────────────────────────────────────────────────────┘
 ```
+
+### 3.8 MultiprocExecutor 与 Workers - 模型执行器与工作进程
+
+**文件**:
+- `vllm/v1/executor/multiproc_executor.py` (92-880行)
+- `vllm/v1/executor/abstract.py` (35-353行)
+- `vllm/v1/worker/gpu_worker.py` (68-730行)
+- `vllm/v1/worker/worker_base.py` (1-400行)
+
+#### 3.8.1 架构概览
+
+```
+┌───────────────────────────────────────────────────────────────────┐
+│                    MultiprocExecutor (主进程)                      │
+│  ┌─────────────────────────────────────────────────────────────┐  │
+│  │                  Worker 管理与 RPC 调度                       │  │
+│  │                                                             │  │
+│  │  ┌───────────────┐  ┌───────────────┐  ┌───────────────┐    │  │
+│  │  │ WorkerProc[0] │  │ WorkerProc[1] │  │ WorkerProc[2] │    │  │
+│  │  │ (进程句柄)     │  │ (进程句柄)     │  │ (进程句柄)     │    │  │
+│  │  └───────────────┘  └───────────────┘  └───────────────┘    │  │
+│  └─────────────────────────────────────────────────────────────┘  │
+└───────────────────────────────────────────────────────────────────┘
+                              │
+                              │ RPC 消息队列
+                              ▼
+┌───────────────────────────────────────────────────────────────────┐
+│                       Worker 进程 (独立进程)                        │
+│  ┌─────────────────────────────────────────────────────────────┐  │
+│  │  Worker (WorkerBase)                                         │  │
+│  │  ├─ ModelRunner (模型执行)                                   │  │
+│  │  ├─ CacheEngine (缓存管理)                                   │  │
+│  │  └─ RPC 服务循环 (worker_busy_loop)                          │  │
+│  └─────────────────────────────────────────────────────────────┘  │
+└───────────────────────────────────────────────────────────────────┘
+```
+
+#### 3.8.2 MultiprocExecutor 核心职责
+
+**文件**: `vllm/v1/executor/multiproc_executor.py`
+
+| 职责类别              | 功能描述                   | 关键方法                               |
+| ----------------- | ---------------------- | ---------------------------------- |
+| **Worker 生命周期管理** | 创建、监控、关闭 Worker 进程     | `_init_executor()`, `shutdown()`   |
+| **RPC 通信调度**      | 将上层请求转发到 Workers 并收集结果 | `collective_rpc()`                 |
+| **消息队列管理**        | 维护广播队列和响应队列            | `rpc_broadcast_mq`, `response_mqs` |
+| **并行配置管理**        | 管理 TP/PP/DP 等并行配置      | `max_concurrent_batches`           |
+| **健康监控**          | 监控 Worker 进程状态，异常处理    | `start_worker_monitor()`           |
+| **输出聚合**          | 聚合多个 Worker 的输出结果      | `kv_output_aggregator`             |
+
+**Worker 创建流程**:
+
+```python
+def _init_executor(self) -> None:
+    # 1. 计算需要创建的 Worker 数量
+    self.world_size = self.parallel_config.world_size  # TP × PP × PCP
+    self.local_world_size = self.parallel_config.local_world_size
+
+    # 2. 创建多个 Worker 进程
+    for local_rank in range(self.local_world_size):
+        global_rank = global_start_rank + local_rank
+        unready_workers.append(
+            WorkerProc.make_worker_process(...)  # 启动独立进程
+        )
+
+    # 3. 等待所有 Worker 就绪
+    self.workers = WorkerProc.wait_for_ready(unready_workers)
+
+    # 4. 启动健康监控线程
+    self.start_worker_monitor()
+```
+
+**World Size 计算规则**:
+
+| 配置 | world_size | local_world_size | 说明 |
+|------|-----------|------------------|------|
+| TP=4, 单机 | 4 | 4 | 创建 4 个 Worker |
+| TP=4, PP=2, 单机 | 8 | 8 | 创建 8 个 Worker |
+| TP=4, PP=2, 2节点 | 8 | 4 | 每节点 4 个 Worker |
+| TP=2, DP=2 | 2 | 2 | DP 不影响 Worker 数 |
+
+#### 3.8.3 Worker 核心职责
+
+**文件**: `vllm/v1/worker/gpu_worker.py`, `vllm/v1/worker/worker_base.py`
+
+| 组件                      | 职责                    | 关键属性/方法                                               |
+| ----------------------- | --------------------- | ----------------------------------------------------- |
+| **Worker (WorkerBase)** | 进程入口、RPC 服务、生命周期管理    | `worker_busy_loop()`, `init_device()`, `load_model()` |
+| **ModelRunner**         | 模型前向执行、KV Cache 管理、采样 | `execute_model()`, `sample_tokens()`, `profile()`     |
+| **CacheEngine**         | KV Cache 分配与管理        | `initialize_cache()`, `get_kv_cache_spec()`           |
+| **WorkerProc**          | 进程封装、消息队列通信           | `worker_main()`, `make_worker_process()`              |
+
+**Worker 进程结构**:
+
+```python
+class Worker(WorkerBase):
+    def __init__(self, vllm_config, local_rank, rank, ...):
+        # 每个 Worker 有自己的 rank 信息
+        self.rank = rank                    # 全局 rank
+        self.local_rank = local_rank        # 节点内 rank
+
+        # 初始化 ModelRunner
+        self.model_runner = GPUModelRunner(vllm_config, device)
+
+        # 初始化设备
+        self.init_device()                  # 设置 CUDA 设备
+
+        # 加载模型
+        self.load_model()
+
+    def execute_model(self, scheduler_output):
+        # 执行模型推理
+        return self.model_runner.execute_model(scheduler_output)
+
+    def sample_tokens(self, grammar_output):
+        # 采样 token
+        return self.model_runner.sample_tokens(grammar_output)
+```
+
+#### 3.8.4 RPC 通信机制
+
+**通信架构**:
+
+```
+MultiprocExecutor                    Workers
+        │                                  │
+        │  ┌─────────────────────────┐    │
+        ├─>│ rpc_broadcast_mq        │    │
+        │  │ (SchedulerOutput)       │──┐ │
+        │  └─────────────────────────┘  │ │
+        │                              ▼ ▼
+        │                        ┌──────────┐
+        │                        │ Worker 0 │
+        │                        └──────────┘
+        │                              │
+        │  ┌─────────────────────────┐  │
+        │  │ response_mqs[0]         │◄─┘
+        │  │ (ModelRunnerOutput)     │
+        │  └─────────────────────────┘
+        │
+        ▼
+   返回结果
+```
+
+**RPC 调用流程**:
+
+```python
+# 1. MultiprocExecutor 接收上层调用
+def collective_rpc(self, method, args=(), kwargs=None, ...):
+    # 2. 将请求放入广播队列
+    self.rpc_broadcast_mq.enqueue((method, args, kwargs, output_rank))
+
+    # 3. 从响应队列获取结果
+    for mq in response_mqs:
+        status, result = mq.dequeue(timeout=dequeue_timeout)
+        responses.append(result)
+
+    return responses[0] if output_rank is not None else responses
+```
+
+**Worker RPC 处理**:
+
+```python
+# Worker 进程中的 worker_busy_loop():
+def worker_busy_loop(self, cancel=None):
+    while True:
+        # 1. 从广播队列接收请求
+        method, args, kwargs, output_rank = self.rpc_broadcast_mq.dequeue()
+
+        # 2. 执行方法
+        if isinstance(method, str):
+            func = getattr(self.worker, method)
+        output = func(*args, **kwargs)
+
+        # 3. 返回结果
+        if output_rank is None or self.rank == output_rank:
+            self.handle_output(output)
+```
+
+#### 3.8.5 Master-Worker 设计模式
+
+```
+┌──────────────────────────────────────────────────────────┐
+│  Master (MultiprocExecutor)                               │
+│  - 管理 Worker 生命周期                                    │
+│  - 分发任务到 Workers                                      │
+│  - 聚合 Worker 结果                                        │
+│  - 不执行模型计算                                          │
+└──────────────────────────────────────────────────────────┘
+        │                │                │
+        ▼                ▼                ▼
+┌─────────────┐  ┌─────────────┐  ┌─────────────┐
+│  Worker 0   │  │  Worker 1   │  │  Worker 2   │
+│  - 执行模型  │  │  - 执行模型  │  │  - 执行模型  │
+│  - 管理 GPU  │  │  - 管理 GPU  │  │  - 管理 GPU  │
+│  - 计算      │  │  - 计算      │  │  - 计算      │
+└─────────────┘  └─────────────┘  └─────────────┘
+```
+
+#### 3.8.6 进程关系与通信
+
+**进程隔离**:
+
+```
+┌─────────────────────────────────────────────────────┐
+│ 主进程: MultiprocExecutor                            │
+│ - Python 进程 1                                       │
+│ - 负责 RPC 调度和 Worker 管理                          │
+└─────────────────────────────────────────────────────┘
+                    │ spawns
+        ┌───────────┼───────────┐
+        ▼           ▼           ▼
+┌──────────┐ ┌──────────┐ ┌──────────┐
+│ Worker 0 │ │ Worker 1 │ │ Worker 2 │  ← 独立子进程
+│ [rank=0] │ │ [rank=1] │ │ [rank=2] │
+└──────────┘ └──────────┘ └──────────┘
+```
+
+**消息队列**:
+
+| 队列 | 方向 | 内容 |
+|------|------|------|
+| `rpc_broadcast_mq` | Executor → Workers | RPC 请求 (method, args, kwargs) |
+| `response_mqs` | Workers → Executor | RPC 响应 (status, result) |
+| `peer_worker_response_mqs` | Worker ↔ Worker | 跨节点通信 |
+
+#### 3.8.7 调用示例
+
+**场景：EngineCore 调用 `execute_model()`**
+
+```python
+# 1. EngineCore (主进程)
+scheduler_output = scheduler.schedule()
+
+# 2. MultiprocExecutor.collective_rpc()
+output = executor.collective_rpc(
+    "execute_model",
+    args=(scheduler_output,),
+    unique_reply_rank=output_rank  # 只从指定 Worker 获取输出
+)
+
+# 3. 广播到所有 Workers
+rpc_broadcast_mq.enqueue(("execute_model", (scheduler_output,), {}, output_rank))
+
+# 4. 每个 Worker 接收并执行
+# Worker 进程中的 worker_busy_loop():
+method, args, kwargs, output_rank = rpc_broadcast_mq.dequeue()
+output = worker.execute_model(*args, **kwargs)  # 调用 ModelRunner
+response_mq.enqueue((SUCCESS, output))
+
+# 5. MultiprocExecutor 收集结果
+status, result = response_mqs[output_rank].dequeue()
+return result
+```
+
+#### 3.8.8 关键代码位置
+
+| 组件 | 文件路径 | 关键行数 |
+|------|---------|---------|
+| **Executor 抽象类** | `vllm/v1/executor/abstract.py` | 35-353 |
+| **MultiprocExecutor** | `vllm/v1/executor/multiproc_executor.py` | 92-880 |
+| **Worker 基类** | `vllm/v1/worker/worker_base.py` | 1-400 |
+| **GPU Worker** | `vllm/v1/worker/gpu_worker.py` | 68-730 |
+| **WorkerProc** | `vllm/v1/executor/multiproc_executor.py` | 476-613 |
+| **RPC 消息队列** | `vllm/distributed/device_communicators/shm_broadcast.py` | - |
+
+#### 3.8.9 设计优势
+
+| 优势 | 说明 |
+|------|------|
+| **进程隔离** | Worker 崩溃不会影响主进程 |
+| **负载均衡** | 通过 RPC 调度实现负载分发 |
+| **并行执行** | 多个 Worker 并行处理不同请求 |
+| **易于扩展** | 支持动态添加/移除 Worker |
+| **容错机制** | 监控线程自动检测并处理异常 |
 
 ---
 
